@@ -265,9 +265,19 @@ jobs:
               grep --null -rl "$OLD_GOLD_DW_ENDPOINT" "${GITHUB_WORKSPACE}/workspace" | tr '\0' '\n'
               grep --null -rl $OLD_GOLD_DW_ENDPOINT ${GITHUB_WORKSPACE}/workspace | xargs -0 sed -i "s/$OLD_GOLD_DW_ENDPOINT/$NEW_GOLD_DW_ENDPOINT/g"              
 
-              echo "Files to be updated from $OLD_WIDE_WORLD_IMPORTERS_CONNECTION_ID to $WIDE_WORLD_IMPORTERS_CONNECTION_ID"
+              # Fabric validates connection references at pipeline-create time, so the WWI
+              # source must resolve to a connection the SP can access even before WWI exists.
+              # Placeholder sentinel => stand in the controlDB connection created earlier this run;
+              # the Phase 5 re-run (real WWI connection ID in env) rewrites it from a fresh checkout.
+              if [ "$WIDE_WORLD_IMPORTERS_CONNECTION_ID" = "00000000-0000-0000-0000-000000000001" ]; then
+                WWI_TARGET_CONNECTION_ID=$NEW_CONTROLDB_CONNECTION_ID
+                echo "No WWI connection configured - standing in controlDB connection $WWI_TARGET_CONNECTION_ID"
+              else
+                WWI_TARGET_CONNECTION_ID=$WIDE_WORLD_IMPORTERS_CONNECTION_ID
+              fi
+              echo "Files to be updated from $OLD_WIDE_WORLD_IMPORTERS_CONNECTION_ID to $WWI_TARGET_CONNECTION_ID"
               grep --null -rl "$OLD_WIDE_WORLD_IMPORTERS_CONNECTION_ID" "${GITHUB_WORKSPACE}/workspace" | tr '\0' '\n'
-              grep --null -rl $OLD_WIDE_WORLD_IMPORTERS_CONNECTION_ID ${GITHUB_WORKSPACE}/workspace | xargs -0 sed -i "s/$OLD_WIDE_WORLD_IMPORTERS_CONNECTION_ID/$WIDE_WORLD_IMPORTERS_CONNECTION_ID/g"
+              grep --null -rl $OLD_WIDE_WORLD_IMPORTERS_CONNECTION_ID ${GITHUB_WORKSPACE}/workspace | xargs -0 sed -i "s/$OLD_WIDE_WORLD_IMPORTERS_CONNECTION_ID/$WWI_TARGET_CONNECTION_ID/g"
 
               echo "Files to be updated with new Tenant ID"
               grep --null -rl "$OLD_TENANT_ID" "${GITHUB_WORKSPACE}/workspace" | tr '\0' '\n'
