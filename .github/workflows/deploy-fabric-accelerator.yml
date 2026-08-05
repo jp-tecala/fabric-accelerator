@@ -1,22 +1,92 @@
 name: Deploy Fabric Accelerator
-on: workflow_dispatch 
+on:
+  workflow_dispatch:
+    inputs:
+      workspace_name:
+        description: 'Fabric workspace to create/deploy into'
+        type: string
+        default: ws-fabric-demo-dev
+      capacity_name:
+        description: 'Fabric capacity (existing, or name for a new one)'
+        type: string
+        default: fabricdemoaue
+      item_suffix:
+        description: 'Suffix for medallion items: bronze_<suffix>, silver_<suffix>, gold_<suffix>. Must not contain lh_bronze/lh_silver/dw_gold'
+        type: string
+        default: fabric_demo
+      controldb_name:
+        description: 'Name of the ELT metadata (control) database'
+        type: string
+        default: controldb-fabric-demo
+      wwi_connection_id:
+        description: 'WideWorldImporters source connection ID. Keep the default sentinel if no source exists yet (controlDB connection stands in)'
+        type: string
+        default: 00000000-0000-0000-0000-000000000001
 env:
-  FABRIC_CAPACITY_NAME: fabricdemoaue
+  FABRIC_CAPACITY_NAME: ${{ inputs.capacity_name }}
   FABRIC_CAPACITY_LOCATION: australiaeast
   FABRIC_CAPACITY_SKU: F2
   FABRIC_CAPACITY_ADMIN_ID: 695711b3-6460-45b5-a1ad-00e2c278efa2 # sp-fabric-demo-dev object ID
   RESOURCE_GROUP: rg-fabric-demo-dev-aue
-  WORKSPACE_NAME: ws-fabric-demo-dev
+  WORKSPACE_NAME: ${{ inputs.workspace_name }}
   WORKSPACE_ADMIN_ID: aaf63b89-c02f-4a3d-b03a-51a9f2222686 # sg-fabric-demo-admins object ID
   WORKSPACE_ADMIN_TYPE: group # valid values: user, group
-  FABRIC_SQL_DB_NAME: controldb-fabric-demo
-  BRONZE_LH: bronze_fabric_demo
-  SILVER_LH: silver_fabric_demo
-  GOLD_DW: gold_fabric_demo
-  WIDE_WORLD_IMPORTERS_CONNECTION_ID: 00000000-0000-0000-0000-000000000001 # placeholder until Phase 5 (WWI connection)
+  FABRIC_SQL_DB_NAME: ${{ inputs.controldb_name }}
+  BRONZE_LH: bronze_${{ inputs.item_suffix }}
+  SILVER_LH: silver_${{ inputs.item_suffix }}
+  GOLD_DW: gold_${{ inputs.item_suffix }}
+  WIDE_WORLD_IMPORTERS_CONNECTION_ID: ${{ inputs.wwi_connection_id }}
 
 jobs:
+  # Fail fast on the environment problems that otherwise surface mid-deploy:
+  # paused capacity, missing tenant settings, broken SP credentials.
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: '{"clientId":"${{ secrets.ACTION_SPN_CLIENTID }}","clientSecret":"${{ secrets.ACTION_SPN_SECRET }}","subscriptionId":"${{ secrets.SUBSCRIPTION_ID }}","tenantId":"${{ secrets.TENANT_ID }}"}'
+
+      - name: Ensure capacity is running (resume if paused)
+        run: |
+          az extension add --name microsoft-fabric --only-show-errors
+          state=$(az fabric capacity show -g "$RESOURCE_GROUP" --capacity-name "$FABRIC_CAPACITY_NAME" --query state -o tsv 2>/dev/null || echo "NotFound")
+          echo "Capacity $FABRIC_CAPACITY_NAME state: $state"
+          case "$state" in
+            Active)
+              echo "Capacity already running." ;;
+            Paused|Suspended)
+              echo "Resuming capacity..."
+              az fabric capacity resume -g "$RESOURCE_GROUP" --capacity-name "$FABRIC_CAPACITY_NAME"
+              echo "Capacity resumed." ;;
+            NotFound)
+              echo "Capacity does not exist yet - the deploy job will create it." ;;
+            *)
+              echo "::error::Capacity is in unexpected state '$state' - resolve manually before deploying."
+              exit 1 ;;
+          esac
+
+      - name: Verify service principal tenant settings
+        run: |
+          token=$(az account get-access-token --resource https://api.fabric.microsoft.com --query accessToken -o tsv)
+          settings=$(curl -sf -H "Authorization: Bearer $token" "https://api.fabric.microsoft.com/v1/admin/tenantsettings") || {
+            echo "::error::Cannot read tenant settings as the service principal. Enable 'Service principals can access read-only admin APIs' for the SP's security group in the Fabric admin portal."
+            exit 1
+          }
+          fail=0
+          for title in "Service principals can call Fabric public APIs" "Service principals can create workspaces, connections, and deployment pipelines"; do
+            enabled=$(echo "$settings" | jq -r --arg t "$title" '.tenantSettings[] | select(.title==$t) | .enabled')
+            echo "$title => enabled=$enabled"
+            if [ "$enabled" != "true" ]; then
+              echo "::error::Tenant setting not enabled: $title"
+              fail=1
+            fi
+          done
+          exit $fail
+
   deploy-fabric-accelerator:
+    needs: preflight
     env:
      NEW_FABRIC_CAPACITY_ID: null
      NEW_FABRIC_WORKSPACE_ID: null
@@ -1079,4 +1149,83 @@ jobs:
 
         - name: Azure Logout
           run: |
-            az logout            
+            az logout
+
+  # Deploy the ELT Framework controlDB objects (dacpac) straight from the upstream
+  # elt-framework repo - replaces the separate fork, five extra secrets and manual trigger.
+  deploy-controldb:
+    runs-on: windows-latest
+    needs: deploy-fabric-accelerator
+    steps:
+        - name: Checkout elt-framework (controlDB source, pinned)
+          uses: actions/checkout@v6
+          with:
+            repository: bennyaustin/elt-framework
+            ref: 13f64a871664bf86a604dff1bf035d0557164593
+
+        - name: Azure Login
+          uses: Azure/login@v1
+          with:
+              creds: '{"clientId":"${{ secrets.ACTION_SPN_CLIENTID }}","clientSecret":"${{ secrets.ACTION_SPN_SECRET }}","subscriptionId":"${{ secrets.SUBSCRIPTION_ID }}","tenantId":"${{ secrets.TENANT_ID }}"}'
+
+        - name: Add msbuild to PATH
+          uses: microsoft/setup-msbuild@v3
+
+        - name: Build ControlDB dacpac
+          shell: pwsh
+          run: |
+            msbuild "${{ github.workspace }}/elt-framework/ControlDB/ControlDB.sqlproj" /p:Configuration=Release /p:Platform="Any CPU" /p:WarningLevel=0
+
+        # The sqlproj's OutputPath is bin\Release but upstream docs say bin\Output -
+        # locate the built dacpac instead of hard-coding either path.
+        - name: Locate ControlDB dacpac
+          id: locate_dacpac
+          shell: pwsh
+          run: |
+            $dacpac = Get-ChildItem -Path "${{ github.workspace }}/elt-framework/ControlDB" -Recurse -Filter ControlDB.dacpac | Select-Object -First 1
+            if (-not $dacpac) { Write-Error "ControlDB.dacpac not found after build"; exit 1 }
+            Write-Host "Found dacpac: $($dacpac.FullName)"
+            "dacpac_path=$($dacpac.FullName)" >> $env:GITHUB_OUTPUT
+
+        - name: Fabric CLI Python Pre-Requisites
+          uses: actions/setup-python@v4
+          with:
+            python-version: 3.12
+
+        - name: Install Fabric CLI
+          run: python -m pip install ms-fabric-cli
+
+        - name: Get controlDB connection string
+          id: get_controldb_connection_string
+          shell: pwsh
+          run: |
+            fab config set encryption_fallback_enabled true
+            fab auth login -u "${{ secrets.ACTION_SPN_CLIENTID }}" -p "${{ secrets.ACTION_SPN_SECRET }}" --tenant "${{ secrets.TENANT_ID }}"
+
+            $resourcePath = "${{ env.WORKSPACE_NAME }}.Workspace/${{ env.FABRIC_SQL_DB_NAME }}.SQLDatabase"
+            $server = (fab get "$resourcePath" -q properties.serverFqdn -f).Trim() -replace '^tcp:','' -replace ',\d+$',''
+            $database = (fab get "$resourcePath" -q properties.databaseName -f).Trim()
+
+            $cs = "Server=tcp:$server,1433;Initial Catalog=$database;MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;Authentication=Active Directory Service Principal;User Id=${{ secrets.ACTION_SPN_CLIENTID }};Password=${{ secrets.ACTION_SPN_SECRET }}"
+            "controldb_connection_string=$cs" >> $env:GITHUB_OUTPUT
+
+        - name: Deploy ControlDB
+          uses: Azure/sql-action@v2.3
+          with:
+            connection-string: ${{ steps.get_controldb_connection_string.outputs.controldb_connection_string }}
+            path: ${{ steps.locate_dacpac.outputs.dacpac_path }}
+            action: Publish
+            arguments: >
+              /p:DropPermissionsNotInSource=false
+              /p:BlockOnPossibleDataLoss=false
+              /p:DropRoleMembersNotInSource=false
+              /p:DropObjectsNotInSource=false
+              /p:IgnoreColumnOrder=true
+              /p:IgnorePermissions=true
+              /p:IgnorePostDeployScript=false
+              /p:AllowIncompatiblePlatform=true
+              /p:ExcludeObjectTypes=Logins;Users
+            skip-firewall-check: true
+
+        - name: Fabric Logout
+          run: fab auth logout            
